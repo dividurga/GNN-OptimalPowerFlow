@@ -68,10 +68,13 @@ def generate_datasets(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    bus_ids = net.bus.index
-    columns = []
+    bus_ids  = net.bus.index
+    line_ids = net.line.index
+    columns  = []
     for b in bus_ids:
         columns.extend([f"P_{b + 1} (PQ)", f"Q_{b + 1} (PQ)", f"V_{b + 1}", f"d_{b + 1}"])
+    for l in line_ids:
+        columns.append(f"line_{l}_in_service")
 
     original_p = net.load['p_mw'].copy()
     original_q = net.load['q_mvar'].copy()
@@ -125,6 +128,9 @@ def generate_datasets(
                 v_mag = net.res_bus.at[b, 'vm_pu']
                 v_ang = net.res_bus.at[b, 'va_degree']
                 row.extend([p_load, q_load, v_mag, v_ang])
+
+            # Append per-line in-service status (1=active, 0=out)
+            row.extend(net.line['in_service'].astype(int).values.tolist())
 
             data.append(row)
 

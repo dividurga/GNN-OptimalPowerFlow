@@ -4,7 +4,6 @@ Mirrors the paper's make_dataset / normalize_dataset methodology exactly.
 """
 
 import os
-import glob
 
 import numpy as np
 import pandas as pd
@@ -21,8 +20,15 @@ NETWORK_MAP = {
 }
 
 
-def load_excel_datasets(dataset_dir: str, file_indices: list[int]) -> np.ndarray:
-    """Load and concatenate rows from multiple PF_Dataset_N.xlsx files."""
+def load_excel_datasets(dataset_dir: str, file_indices: list[int]):
+    """
+    Load and concatenate rows from multiple PF_Dataset_N.xlsx files.
+
+    Returns:
+        bus_data   : np.ndarray, shape [n_samples, n_bus * 4]  (P, Q, V, δ per bus)
+        line_status: np.ndarray or None, shape [n_samples, n_lines]  (1=in_service, 0=out)
+                     None when the dataset has no line-outage columns (no-outage datasets).
+    """
     dfs = []
     for idx in file_indices:
         path = os.path.join(dataset_dir, f"PF_Dataset_{idx}.xlsx")
@@ -30,48 +36,74 @@ def load_excel_datasets(dataset_dir: str, file_indices: list[int]) -> np.ndarray
             raise FileNotFoundError(f"Dataset file not found: {path}")
         dfs.append(pd.read_excel(path))
     df = pd.concat(dfs, ignore_index=True)
-    # Drop the 'Dataset' and 'Data' label columns (first two cols from generation script)
     label_cols = [c for c in df.columns if c in ('Dataset', 'Data')]
     df = df.drop(columns=label_cols)
-    return df.values.astype(np.float32)
+    df = df.dropna()  # drop samples with any NaN (e.g. from disconnected buses)
+
+    line_cols = [c for c in df.columns if c.startswith('line_') and c.endswith('_in_service')]
+    bus_cols  = [c for c in df.columns if c not in line_cols]
+
+    bus_data    = df[bus_cols].values.astype(np.float32)
+    line_status = df[line_cols].values.astype(np.float32) if line_cols else None
+    return bus_data, line_status
 
 
-def make_dataset(dataset: np.ndarray, n_bus: int):
+def make_dataset(
+    dataset: np.ndarray,
+    n_bus: int,
+    line_status: np.ndarray | None,
+    from_buses: list[int],
+    to_buses: list[int],
+):
     """
-    Convert raw flat dataset rows into (x, y) tensors.
+    Convert raw flat dataset rows into (x, y) tensors and per-sample edge indices.
 
     x shape: [n_samples, n_bus, 7]  — P, Q, V, δ, is_pv, is_pq, is_slack
     y shape: [n_samples, n_bus, 2]  — V, δ  (Newton-Raphson ground truth)
+    edge_indices: list of [2, n_active_edges] tensors, one per sample.
+                  Uses the full base topology when no line_status is provided.
     """
-    x_raw, y_raw = [], []
+    x_raw, y_raw, edge_indices = [], [], []
+    base_ei = torch.tensor(
+        [from_buses + to_buses, to_buses + from_buses], dtype=torch.long
+    )
 
     for i in range(len(dataset)):
         x_sample, y_sample = [], []
         for n in range(n_bus):
             is_slack = int(n == 0)
-            is_pv    = int(n != 0 and dataset[i, 4 * n + 2] == 0)
-            is_pq    = int(n != 0 and dataset[i, 4 * n + 2] != 0)
+            is_pv    = int(n != 0 and dataset[i, 4 * n + 1] == 0)
+            is_pq    = int(n != 0 and dataset[i, 4 * n + 1] != 0)
 
             x_sample.append([
-                dataset[i, 4 * n + 1],  # P
-                dataset[i, 4 * n + 2],  # Q
-                dataset[i, 4 * n + 3],  # V
-                dataset[i, 4 * n + 4],  # δ
+                dataset[i, 4 * n],      # P
+                dataset[i, 4 * n + 1],  # Q
+                dataset[i, 4 * n + 2],  # V
+                dataset[i, 4 * n + 3],  # δ
                 float(is_pv),
                 float(is_pq),
                 float(is_slack),
             ])
             y_sample.append([
-                dataset[i, 4 * n + 3],  # V  (target)
-                dataset[i, 4 * n + 4],  # δ  (target)
+                dataset[i, 4 * n + 2],  # V  (target)
+                dataset[i, 4 * n + 3],  # δ  (target)
             ])
+
+        if line_status is not None:
+            active = line_status[i].astype(bool)
+            fb = [from_buses[j] for j, a in enumerate(active) if a]
+            tb = [to_buses[j]   for j, a in enumerate(active) if a]
+            ei = torch.tensor([fb + tb, tb + fb], dtype=torch.long)
+        else:
+            ei = base_ei
 
         x_raw.append(x_sample)
         y_raw.append(y_sample)
+        edge_indices.append(ei)
 
     x = torch.tensor(x_raw, dtype=torch.float)
     y = torch.tensor(y_raw, dtype=torch.float)
-    return x, y
+    return x, y, edge_indices
 
 
 def normalize_dataset(x: torch.Tensor, y: torch.Tensor):
@@ -99,14 +131,13 @@ def denormalize(tensor: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> 
 
 
 def build_edge_index(n_bus: int) -> torch.Tensor:
-    """Build bidirectional edge index from pandapower network topology."""
+    """Build bidirectional edge index from pandapower network (all lines in service)."""
     net = NETWORK_MAP[n_bus]()
     from_buses = net.line['from_bus'].values.tolist()
     to_buses   = net.line['to_bus'].values.tolist()
-    edge_index = torch.tensor(
+    return torch.tensor(
         [from_buses + to_buses, to_buses + from_buses], dtype=torch.long
     )
-    return edge_index
 
 
 def build_dataloaders(
@@ -120,43 +151,42 @@ def build_dataloaders(
     """
     Load datasets, build (x, y) tensors, normalise, and return DataLoaders
     plus the training normalisation statistics needed for evaluation.
+
+    Each Data object carries its own edge_index, reflecting per-sample line
+    outage status when line-status columns are present in the dataset files.
+    Falls back to the full base topology for datasets without outage columns.
     """
-    edge_index = build_edge_index(n_bus)
+    net = NETWORK_MAP[n_bus]()
+    from_buses = net.line['from_bus'].values.tolist()
+    to_buses   = net.line['to_bus'].values.tolist()
 
-    raw_train = load_excel_datasets(dataset_dir, train_indices)
-    raw_val   = load_excel_datasets(dataset_dir, val_indices)
-    raw_test  = load_excel_datasets(dataset_dir, test_indices)
+    raw_train, ls_train = load_excel_datasets(dataset_dir, train_indices)
+    raw_val,   ls_val   = load_excel_datasets(dataset_dir, val_indices)
+    raw_test,  ls_test  = load_excel_datasets(dataset_dir, test_indices)
 
-    x_train, y_train = make_dataset(raw_train, n_bus)
-    x_val,   y_val   = make_dataset(raw_val,   n_bus)
-    x_test,  y_test  = make_dataset(raw_test,  n_bus)
+    x_train, y_train, ei_train = make_dataset(raw_train, n_bus, ls_train, from_buses, to_buses)
+    x_val,   y_val,   ei_val   = make_dataset(raw_val,   n_bus, ls_val,   from_buses, to_buses)
+    x_test,  y_test,  ei_test  = make_dataset(raw_test,  n_bus, ls_test,  from_buses, to_buses)
 
     x_train, y_train, x_mean, y_mean, x_std, y_std = normalize_dataset(x_train, y_train)
 
-    # Normalise val/test with training statistics
-    x_val  = (x_val  - x_mean) / x_std;  x_val[:, :, 4:]  = (x_val  * x_std + x_mean)[:, :, 4:]
-    x_test = (x_test - x_mean) / x_std;  x_test[:, :, 4:] = (x_test * x_std + x_mean)[:, :, 4:]
-
-    def _fix_flags(x_norm, x_raw):
-        """Restore un-normalised bus-type flags after applying train stats."""
-        x_norm[:, :, 4:] = x_raw[:, :, 4:]
+    def _apply_train_stats(x_raw):
+        x_norm = (x_raw - x_mean) / x_std
+        x_norm[:, :, 4:] = x_raw[:, :, 4:]   # restore bus-type flags un-normalised
         return x_norm
 
-    x_raw_val,  _ = make_dataset(raw_val,  n_bus)
-    x_raw_test, _ = make_dataset(raw_test, n_bus)
-    x_val  = _fix_flags((x_raw_val  - x_mean) / x_std, x_raw_val)
-    x_test = _fix_flags((x_raw_test - x_mean) / x_std, x_raw_test)
-
+    x_val  = _apply_train_stats(x_val)
+    x_test = _apply_train_stats(x_test)
     y_val  = (y_val  - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    def _to_loader(x, y, shuffle):
-        data_list = [Data(x=xi, y=yi, edge_index=edge_index) for xi, yi in zip(x, y)]
+    def _to_loader(x, y, edge_indices, shuffle):
+        data_list = [Data(x=xi, y=yi, edge_index=ei) for xi, yi, ei in zip(x, y, edge_indices)]
         return DataLoader(data_list, batch_size=batch_size, shuffle=shuffle)
 
-    train_loader = _to_loader(x_train, y_train, shuffle=True)
-    val_loader   = _to_loader(x_val,   y_val,   shuffle=False)
-    test_loader  = _to_loader(x_test,  y_test,  shuffle=False)
+    train_loader = _to_loader(x_train, y_train, ei_train, shuffle=True)
+    val_loader   = _to_loader(x_val,   y_val,   ei_val,   shuffle=False)
+    test_loader  = _to_loader(x_test,  y_test,  ei_test,  shuffle=False)
 
     stats = dict(x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
     return train_loader, val_loader, test_loader, stats

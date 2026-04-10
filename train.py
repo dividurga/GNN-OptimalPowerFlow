@@ -103,7 +103,7 @@ def main():
     parser.add_argument('--bus',         type=int,   default=14,           choices=[14, 30, 57, 118])
     parser.add_argument('--gnn_type',    type=str,   default='GraphConv',  choices=list(SUPPORTED_TYPES))
     parser.add_argument('--dataset_dir', type=str,   default=None,
-                        help='Path to dataset directory. Defaults to Datasets/<N>Bus/')
+                        help='Path to dataset directory. Defaults to PertubedDatasets/<N>Bus/')
     parser.add_argument('--train_files', type=int,   nargs='+', default=list(range(1, 17)),
                         help='Dataset file indices to use for training (default: 1-16)')
     parser.add_argument('--val_files',   type=int,   nargs='+', default=[17, 18],
@@ -124,7 +124,7 @@ def main():
                         help='Where to save results. Defaults to Results/<N>Bus_<gnn_type>/')
     args = parser.parse_args()
 
-    dataset_dir = args.dataset_dir or os.path.join('Datasets', f'{args.bus}Bus')
+    dataset_dir = args.dataset_dir or os.path.join('PerturbedDatasets', f'{args.bus}Bus')
     output_dir  = args.output_dir  or os.path.join('Results', f'{args.bus}Bus_{args.gnn_type}')
     os.makedirs(output_dir, exist_ok=True)
 
