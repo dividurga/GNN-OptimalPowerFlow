@@ -125,7 +125,11 @@ def main():
     args = parser.parse_args()
 
     dataset_dir = args.dataset_dir or os.path.join('PerturbedDatasets', f'{args.bus}Bus')
-    output_dir  = args.output_dir  or os.path.join('Results', f'{args.bus}Bus_{args.gnn_type}')
+    if args.output_dir:
+        output_dir = args.output_dir
+    else:
+        suffix = '_outages' if 'outage' in dataset_dir.lower() else ''
+        output_dir = os.path.join('Results', f'{args.bus}Bus_{args.gnn_type}{suffix}')
     os.makedirs(output_dir, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -209,6 +213,7 @@ def main():
 
     # ---------------------------------------------------------- save hyperparams
     hp = vars(args)
+    hp['dataset_dir'] = dataset_dir
     hp['best_epoch'] = best_epoch
     hp['best_val_loss'] = best_val_loss
     with open(os.path.join(output_dir, f'[{args.bus} bus] Hyperparameters.json'), 'w') as f:
