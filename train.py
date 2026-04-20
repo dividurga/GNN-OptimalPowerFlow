@@ -17,8 +17,10 @@ import os
 import torch
 import matplotlib.pyplot as plt
 
-from gnn.data    import build_dataloaders
-from gnn.model   import GNNPowerFlow, SUPPORTED_TYPES
+from gnn.data         import build_dataloaders
+from gnn.model        import GNNPowerFlow, SUPPORTED_TYPES
+from gnn.mpn          import MPN
+from gnn.physics_loss import PowerImbalance, MixedMSEPowerImbalance
 
 
 # --------------------------------------------------------------------------- #
@@ -29,53 +31,56 @@ def denormalize(t, mean, std):
     return t * std + mean
 
 
-def train_one_epoch(model, loader, optimizer, y_mean, y_std, device):
+def denorm_mse(y_pred, y_true, y_mean, y_std, batch_size):
+    """MSE in denormalised target space (stable comparison scale across losses)."""
+    y_mean_exp = y_mean.view(-1).repeat(batch_size)
+    y_std_exp  = y_std.view(-1).repeat(batch_size)
+    return torch.mean(
+        (denormalize(y_pred.view(-1), y_mean_exp, y_std_exp) -
+         denormalize(y_true.view(-1), y_mean_exp, y_std_exp)) ** 2
+    )
+
+
+def compute_train_loss(loss_type, loss_fn, y_pred, batch, y_mean, y_std):
+    """Compute the configured training loss; y_pred shape [batch, n_bus*2]."""
+    if loss_type == 'mse':
+        return denorm_mse(y_pred, batch.y, y_mean, y_std, batch.num_graphs)
+    if loss_type == 'physics':
+        return loss_fn(y_pred, batch.x, batch.edge_index, batch.edge_attr)
+    if loss_type == 'mixed':
+        y_true = batch.y.view(batch.num_graphs, -1)
+        return loss_fn(y_pred, y_true, batch.x, batch.edge_index, batch.edge_attr)
+    raise ValueError(f"unknown loss_type: {loss_type}")
+
+
+def train_one_epoch(model, loader, optimizer, y_mean, y_std, device,
+                    loss_type='mse', loss_fn=None):
     model.train()
     total_loss = 0.0
 
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad()
-
-        y_pred = model(batch).view(-1)
-        y_true = batch.y.view(-1)
-
-        bs = batch.num_graphs
-        n_bus = model.n_bus
-
-        y_mean_exp = y_mean.view(-1).repeat(bs).to(device)
-        y_std_exp  = y_std.view(-1).repeat(bs).to(device)
-
-        loss = torch.mean(
-            (denormalize(y_pred, y_mean_exp, y_std_exp) -
-             denormalize(y_true, y_mean_exp, y_std_exp)) ** 2
-        )
+        y_pred = model(batch)                       # [batch, n_bus*2]
+        loss = compute_train_loss(loss_type, loss_fn, y_pred, batch, y_mean, y_std)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * bs
+        total_loss += loss.item() * batch.num_graphs
 
     return total_loss / len(loader.dataset)
 
 
 @torch.no_grad()
 def eval_one_epoch(model, loader, y_mean, y_std, device):
+    """Always reports denormalised MSE for cross-model comparability."""
     model.eval()
     total_loss = 0.0
 
     for batch in loader:
         batch = batch.to(device)
-        y_pred = model(batch).view(-1)
-        y_true = batch.y.view(-1)
-        bs = batch.num_graphs
-
-        y_mean_exp = y_mean.view(-1).repeat(bs).to(device)
-        y_std_exp  = y_std.view(-1).repeat(bs).to(device)
-
-        loss = torch.mean(
-            (denormalize(y_pred, y_mean_exp, y_std_exp) -
-             denormalize(y_true, y_mean_exp, y_std_exp)) ** 2
-        )
-        total_loss += loss.item() * bs
+        y_pred = model(batch)
+        loss = denorm_mse(y_pred, batch.y, y_mean, y_std, batch.num_graphs)
+        total_loss += loss.item() * batch.num_graphs
 
     return total_loss / len(loader.dataset)
 
@@ -101,7 +106,16 @@ def save_loss_plot(train_losses, val_losses, out_path, title):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bus',         type=int,   default=14,           choices=[14, 30, 57, 118])
-    parser.add_argument('--gnn_type',    type=str,   default='GraphConv',  choices=list(SUPPORTED_TYPES))
+    parser.add_argument('--gnn_type',    type=str,   default='GraphConv',  choices=list(SUPPORTED_TYPES) + ['MPN'])
+    parser.add_argument('--train_loss',  type=str,   default='mse',        choices=['mse', 'physics', 'mixed'],
+                        help='Training loss. MSE (default) matches other baselines. physics=PowerImbalance only, mixed=MSE+physics.')
+    parser.add_argument('--mixed_alpha',   type=float, default=0.9,
+                        help='Weight on MSE in mixed loss (1-alpha on physics). Default 0.9.')
+    parser.add_argument('--physics_scale', type=float, default=0.02,
+                        help='Scale applied to the physics term in mixed loss. Default 0.02.')
+    parser.add_argument('--mpn_hidden',    type=int,   default=129,   help='MPN hidden dim (default 129).')
+    parser.add_argument('--mpn_layers',    type=int,   default=4,     help='MPN #TAGConv layers (default 4).')
+    parser.add_argument('--mpn_K',         type=int,   default=3,     help='TAGConv filter order K (default 3).')
     parser.add_argument('--dataset_dir', type=str,   default=None,
                         help='Path to dataset directory. Defaults to PertubedDatasets/<N>Bus/')
     parser.add_argument('--train_files', type=int,   nargs='+', default=list(range(1, 17)),
@@ -122,6 +136,9 @@ def main():
     parser.add_argument('--no_batch_norm', action='store_true')
     parser.add_argument('--output_dir',  type=str,   default=None,
                         help='Where to save results. Defaults to Results/<N>Bus_<gnn_type>/')
+    parser.add_argument('--device',      type=str,   default=None,
+                        choices=['cpu', 'cuda', 'mps'],
+                        help='Force a specific device (default: auto-detect)')
     args = parser.parse_args()
 
     dataset_dir = args.dataset_dir or os.path.join('PerturbedDatasets', f'{args.bus}Bus')
@@ -129,10 +146,18 @@ def main():
         output_dir = args.output_dir
     else:
         suffix = '_outages' if 'outage' in dataset_dir.lower() else ''
-        output_dir = os.path.join('Results', f'{args.bus}Bus_{args.gnn_type}{suffix}')
+        loss_suffix = '' if args.train_loss == 'mse' else f'_{args.train_loss}'
+        output_dir = os.path.join('Results', f'{args.bus}Bus_{args.gnn_type}{loss_suffix}{suffix}')
     os.makedirs(output_dir, exist_ok=True)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
     print(f"Device      : {device}")
     print(f"Bus system  : IEEE {args.bus}-bus")
     print(f"GNN type    : {args.gnn_type}")
@@ -152,23 +177,56 @@ def main():
     y_std  = stats['y_std'].to(device)
 
     # ----------------------------------------------------------------- model
-    model = GNNPowerFlow(
-        n_bus          = args.bus,
-        feat_in        = 7,
-        feat_size1     = args.feat_size1,
-        feat_size2     = args.feat_size2,
-        hidden_size    = args.hidden_size,
-        gnn_type       = args.gnn_type,
-        dropout        = args.dropout,
-        use_batch_norm = not args.no_batch_norm,
-    ).to(device)
+    if args.gnn_type == 'MPN':
+        model = MPN(
+            n_bus        = args.bus,
+            nfeature_dim = 7,
+            efeature_dim = 2,
+            hidden_dim   = args.mpn_hidden,
+            n_gnn_layers = args.mpn_layers,
+            K            = args.mpn_K,
+            dropout_rate = args.dropout,
+        ).to(device)
+    else:
+        model = GNNPowerFlow(
+            n_bus          = args.bus,
+            feat_in        = 7,
+            feat_size1     = args.feat_size1,
+            feat_size2     = args.feat_size2,
+            hidden_size    = args.hidden_size,
+            gnn_type       = args.gnn_type,
+            dropout        = args.dropout,
+            use_batch_norm = not args.no_batch_norm,
+        ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {total_params:,}\n")
+    print(f"Trainable parameters: {total_params:,}")
+    print(f"Train loss          : {args.train_loss}\n")
+
+    # ------------------------------------------------------------- loss_fn
+    loss_fn = None
+    if args.train_loss == 'physics':
+        loss_fn = PowerImbalance(
+            x_mean=stats['x_mean'], x_std=stats['x_std'],
+            y_mean=stats['y_mean'], y_std=stats['y_std'],
+            edge_mean=stats['edge_mean'], edge_std=stats['edge_std'],
+            sn_mva=stats['sn_mva'],
+            load_bus_mask=stats['load_bus_mask'],
+        ).to(device)
+    elif args.train_loss == 'mixed':
+        loss_fn = MixedMSEPowerImbalance(
+            x_mean=stats['x_mean'], x_std=stats['x_std'],
+            y_mean=stats['y_mean'], y_std=stats['y_std'],
+            edge_mean=stats['edge_mean'], edge_std=stats['edge_std'],
+            sn_mva=stats['sn_mva'],
+            load_bus_mask=stats['load_bus_mask'],
+            alpha=args.mixed_alpha,
+            physics_scale=args.physics_scale,
+        ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=30, verbose=True
+        optimizer, mode='min', factor=0.5, patience=30
     )
 
     # --------------------------------------------------------------- training
@@ -179,7 +237,10 @@ def main():
     ckpt_path = os.path.join(output_dir, f'[{args.bus} bus] Best_{args.gnn_type}_model.pt')
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, y_mean, y_std, device)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, y_mean, y_std, device,
+            loss_type=args.train_loss, loss_fn=loss_fn,
+        )
         val_loss   = eval_one_epoch(model, val_loader, y_mean, y_std, device)
 
         train_losses.append(train_loss)

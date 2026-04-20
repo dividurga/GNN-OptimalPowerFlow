@@ -36,6 +36,7 @@ htmlcov/
 *.log
 *.tmp
 *.temp
+logs/
 
 # Large/generated project data
 Datasets/
@@ -49,3 +50,9 @@ Report/
 
 # Notebook runtime outputs
 jupyter notebook/.ipynb_checkpoints/
+
+# Cloned external reference repo (used for porting physics loss; not our code)
+PoweFlowNet/
+
+# Unrelated exploratory notebook
+options.ipynb
