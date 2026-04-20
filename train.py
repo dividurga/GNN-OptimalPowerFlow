@@ -118,12 +118,12 @@ def main():
     parser.add_argument('--mpn_K',         type=int,   default=3,     help='TAGConv filter order K (default 3).')
     parser.add_argument('--dataset_dir', type=str,   default=None,
                         help='Path to dataset directory. Defaults to PertubedDatasets/<N>Bus/')
-    parser.add_argument('--train_files', type=int,   nargs='+', default=list(range(1, 17)),
-                        help='Dataset file indices to use for training (default: 1-16)')
-    parser.add_argument('--val_files',   type=int,   nargs='+', default=[17, 18],
-                        help='Dataset file indices to use for validation (default: 17-18)')
-    parser.add_argument('--test_files',  type=int,   nargs='+', default=[19, 20],
-                        help='Dataset file indices to use for testing (default: 19-20)')
+    parser.add_argument('--train_files', type=int,   nargs='+', default=list(range(1, 8)),
+                        help='Dataset file indices to use for training (default: 1-7)')
+    parser.add_argument('--val_files',   type=int,   nargs='+', default=[8],
+                        help='Dataset file indices to use for validation (default: 8)')
+    parser.add_argument('--test_files',  type=int,   nargs='+', default=[8],
+                        help='Dataset file indices to use for testing (default: 8)')
     parser.add_argument('--epochs',      type=int,   default=800)
     parser.add_argument('--patience',    type=int,   default=100)
     parser.add_argument('--batch_size',  type=int,   default=16)

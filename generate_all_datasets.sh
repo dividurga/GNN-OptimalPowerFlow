@@ -7,8 +7,9 @@
 #
 # Directory layout produced under Datasets/<N>Bus/:
 #
-#   train_normal/       Files 1-18  — i.i.d. ±40 % loads, Gaussian N-k, train lines
-#   train_n/            Files 1-18  — i.i.d. ±40 % loads, NO outages (full network)
+#   train_normal/       Files 1-7   — i.i.d. ±40 % loads, Gaussian N-k, train-partition lines
+#                       File  8     — same loads/outages, val-partition lines (topology-disjoint)
+#   train_n/            Files 1-8   — i.i.d. ±40 % loads, NO outages (full network)
 #
 #   test_indist/        Files 1-4   — same distrib as train_normal  (baseline)
 #   test_topo/          Files 1-4   — unseen line indices (test partition), ±40 %
@@ -37,7 +38,8 @@ set -euo pipefail
 # ---- configurable knobs ------------------------------------------------------
 BUSES="${BUSES:-${1:-14 30 57 118}}"   # override with env var or positional arg
 SAMPLES=2000                            # samples per Excel file
-TRAIN_FILES=18                          # files 1-18  → 1-16 train, 17-18 val
+TRAIN_FILES=7                           # files 1-7   → train partition
+VAL_FILES=1                             # file 8      → val partition (topology-disjoint)
 TEST_FILES=4                            # files 1-4   per test set
 TOPO_SEED=42
 
@@ -84,22 +86,32 @@ for BUS in $BUSES; do
 
     # ------------------------------------------------------------------
     # Step 1 — train_normal  (i.i.d. ±40 %, Gaussian N-k, train lines)
-    #          Used for: topology / load / corr generalisation experiments
+    #          Files 1-7: train topology partition
+    #          File  8:   val topology partition  (disjoint from train)
     # ------------------------------------------------------------------
-    log "Step 1 — train_normal"
+    log "Step 1 — train_normal (files 1-${TRAIN_FILES}, train partition)"
     run_gen "$BUS" train_normal \
         --num_datasets "$TRAIN_FILES" \
         --variation 0.4 \
         --topology_split_file "$SPLIT_FILE" \
         --topology_partition train
 
+    log "Step 1b — train_normal (files $((TRAIN_FILES+1))-$((TRAIN_FILES+VAL_FILES)), val partition)"
+    run_gen "$BUS" train_normal \
+        --num_datasets "$VAL_FILES" \
+        --start_index $((TRAIN_FILES+1)) \
+        --variation 0.4 \
+        --topology_split_file "$SPLIT_FILE" \
+        --topology_partition val
+
     # ------------------------------------------------------------------
     # Step 2 — train_n  (full network, NO outages)
-    #          Used for: N-k generalisation experiment (train on N, test on N-1/2/3)
+    #          No topology partition needed — no outages means no topology leakage.
+    #          Files 1-7 train, 8 val (same distribution, no outages either way).
     # ------------------------------------------------------------------
-    log "Step 2 — train_n  (no outages)"
+    log "Step 2 — train_n  (no outages, files 1-$((TRAIN_FILES+VAL_FILES)))"
     run_gen_no_outages "$BUS" train_n \
-        --num_datasets "$TRAIN_FILES" \
+        --num_datasets $((TRAIN_FILES+VAL_FILES)) \
         --variation 0.4
 
     # ------------------------------------------------------------------
@@ -183,9 +195,10 @@ done
 log "All buses complete."
 log ""
 log "Dataset summary:"
-log "  train_normal/      — Files 1-${TRAIN_FILES} (1-16 train, 17-18 val)"
-log "                       i.i.d. ±40 %% loads, Gaussian N-k, train-partition lines"
-log "  train_n/           — Files 1-${TRAIN_FILES}, no outages (full network)"
+log "  train_normal/      — Files 1-${TRAIN_FILES} (train partition lines)"
+log "                       Files $((TRAIN_FILES+1))-$((TRAIN_FILES+VAL_FILES)) (val partition lines, topology-disjoint)"
+log "                       i.i.d. ±40 %% loads, Gaussian N-k outages"
+log "  train_n/           — Files 1-$((TRAIN_FILES+VAL_FILES)), no outages (full network)"
 log ""
 log "  test_indist/       — baseline (same distrib as train_normal)"
 log "  test_topo/         — unseen line indices (20 %% reserved test-partition lines)"

@@ -96,6 +96,7 @@ def generate_datasets(
     outage_exact: int | None = None,
     allowed_line_indices: list[int] | None = None,
     correlated_loads: bool = False,
+    start_index: int = 1,
 ) -> None:
     net = NETWORK_MAP[bus]()
     max_iter = MAX_ITERATIONS[bus]
@@ -116,7 +117,7 @@ def generate_datasets(
     original_q = net.load['q_mvar'].copy()
     original_line_service = net.line['in_service'].copy()
 
-    for dataset_n in range(1, num_datasets + 1):
+    for dataset_n in range(start_index, start_index + num_datasets):
         print(f"Generating dataset {dataset_n}/{num_datasets}...")
         data = []
         skipped = 0
@@ -196,6 +197,8 @@ def main():
                         help="IEEE bus system to use (default: 14)")
     parser.add_argument("--num_datasets", type=int, default=20,
                         help="Number of dataset files to generate (default: 20)")
+    parser.add_argument("--start_index", type=int, default=1,
+                        help="Starting file index for output files (default: 1 → PF_Dataset_1.xlsx)")
     parser.add_argument("--samples", type=int, default=2000,
                         help="Samples per dataset file (default: 2000)")
     parser.add_argument("--variation", type=float, default=0.4,
@@ -217,7 +220,7 @@ def main():
                              "Restricts outages to a partition of line indices so that "
                              "train and test topologies are disjoint.")
     parser.add_argument("--topology_partition", type=str, default=None,
-                        choices=["train", "test"],
+                        choices=["train", "val", "test"],
                         help="Which partition to use from --topology_split_file.")
     parser.add_argument("--correlated_loads", action="store_true",
                         help="All buses share a global load factor; individual noise is "
@@ -270,6 +273,7 @@ def main():
         outage_exact=args.outage_exact,
         allowed_line_indices=allowed_line_indices,
         correlated_loads=args.correlated_loads,
+        start_index=args.start_index,
     )
 
 

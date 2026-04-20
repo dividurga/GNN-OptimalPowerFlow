@@ -1,14 +1,16 @@
 """
-Partitions line indices into train and test sets for topology-disjoint dataset generation.
+Partitions line indices into train, val, and test sets for topology-disjoint dataset generation.
 
-For each IEEE bus system, assigns 80% of line indices to the train partition and 20% to
-the test partition. The resulting JSON is consumed by generate_dataset.py via
---topology_split_file / --topology_partition to ensure that lines removed during test
-evaluation were *never* removed during training.
+For each IEEE bus system, assigns line indices to three disjoint partitions so that
+lines removed during validation and test evaluation were never removed during training.
+The resulting JSON is consumed by generate_dataset.py via
+--topology_split_file / --topology_partition.
+
+Default fractions: 70% train, 10% val, 20% test.
 
 Usage:
     python dataset_generation/make_topology_splits.py --bus 14
-    python dataset_generation/make_topology_splits.py --bus 14 --test_frac 0.2 --seed 42
+    python dataset_generation/make_topology_splits.py --bus 14 --val_frac 0.1 --test_frac 0.2 --seed 42
     # Run for all buses at once:
     for BUS in 14 30 57 118; do
         python dataset_generation/make_topology_splits.py --bus $BUS
@@ -36,6 +38,8 @@ def main():
     )
     parser.add_argument("--bus", choices=["14", "30", "57", "118"], default="14",
                         help="IEEE bus system (default: 14)")
+    parser.add_argument("--val_frac", type=float, default=0.1,
+                        help="Fraction of line indices reserved for the val partition (default: 0.1)")
     parser.add_argument("--test_frac", type=float, default=0.2,
                         help="Fraction of line indices reserved for the test partition (default: 0.2)")
     parser.add_argument("--seed", type=int, default=42,
@@ -53,8 +57,10 @@ def main():
     random.shuffle(indices)
 
     n_test = max(1, int(round(n_lines * args.test_frac)))
+    n_val  = max(1, int(round(n_lines * args.val_frac)))
     test_indices  = sorted(indices[:n_test])
-    train_indices = sorted(indices[n_test:])
+    val_indices   = sorted(indices[n_test:n_test + n_val])
+    train_indices = sorted(indices[n_test + n_val:])
 
     output_dir = args.output_dir or os.path.join(
         os.path.dirname(__file__), "..", "topology_splits"
@@ -66,10 +72,13 @@ def main():
         "bus": args.bus,
         "n_lines": n_lines,
         "seed": args.seed,
+        "val_frac": args.val_frac,
         "test_frac": args.test_frac,
         "n_train_lines": len(train_indices),
+        "n_val_lines": len(val_indices),
         "n_test_lines": len(test_indices),
         "train_line_indices": train_indices,
+        "val_line_indices": val_indices,
         "test_line_indices": test_indices,
     }
     with open(out_path, "w") as fh:
@@ -77,6 +86,7 @@ def main():
 
     print(f"IEEE {args.bus}-bus  ({n_lines} lines total)")
     print(f"  train partition : {len(train_indices)} lines  → {train_indices}")
+    print(f"  val   partition : {len(val_indices)}  lines  → {val_indices}")
     print(f"  test  partition : {len(test_indices)}  lines  → {test_indices}")
     print(f"  saved to        : {out_path}")
 
