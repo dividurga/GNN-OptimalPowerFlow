@@ -103,19 +103,50 @@ tail -f logs/master.log       # baselines
 tail -f logs/master_pi.log    # PI-GNN
 ```
 
-### ⚠️ Training the remaining two bus systems (30 + 118)
+### Training the remaining two bus systems (30 + 118)
 
-The 30-bus and 118-bus systems are **not yet trained** with the current PI-GNN pipeline. To extend the comparison, copy one of the existing scripts and change the bus list:
+Two ready-to-go launchers are provided; pick the one that matches your machine.
+
+#### A. Local macOS / Linux workstation
+
+Use [run_training_30_118_pi.sh](run_training_30_118_pi.sh) — same pattern as `run_training_14_57_pi.sh`:
 
 ```bash
-cp run_training_14_57_pi.sh run_training_30_118_pi.sh
-# Edit the "for bus in 14 57" loop to "for bus in 30 118"
-# Also change log names: master_pi.log → master_30_118_pi.log, etc.
-chmod +x run_training_30_118_pi.sh
+# macOS
 nohup caffeinate -s ./run_training_30_118_pi.sh </dev/null >logs/nohup_30_118_pi.out 2>&1 &
+
+# Linux (no caffeinate needed)
+nohup ./run_training_30_118_pi.sh </dev/null >logs/nohup_30_118_pi.out 2>&1 &
+
+tail -f logs/master_30_118_pi.log
 ```
 
-Same for the 5 baselines — copy `run_training_14_57.sh`, swap the bus list. The 118-bus system is the slowest (~10–15× 14-bus per epoch on MPS); budget a full day per run.
+The shell script expects a conda env named `gnn` and auto-detects the device (CUDA > MPS > CPU). Expect ~6h for 30-bus and ~15–20h for 118-bus on Apple Silicon MPS; much faster on CUDA.
+
+#### B. Princeton Adroit (SLURM / HPC cluster)
+
+Login nodes don't run long jobs — use [slurm_pignn_30_118.slurm](slurm_pignn_30_118.slurm). It submits a **2-task job array** (one per bus) onto GPU nodes.
+
+```bash
+# 1. Edit the script once: set --mail-user to your Princeton email, and confirm
+#    the --partition / --gres lines match your Adroit access (run `sinfo` to see).
+
+# 2. Submit both 30-bus and 118-bus runs in parallel:
+sbatch slurm_pignn_30_118.slurm
+
+# 3. Monitor:
+squeue -u $USER                       # queue status
+tail -f logs/slurm_pignn_30_118_*.out # per-task stdout once running
+tail -f logs/30Bus_MPN_mixed_outages_lessepoch.log   # train.py's own log
+
+# 4. Cancel if needed:
+scancel <jobid>        # cancels the whole array
+scancel <jobid>_0      # cancels just the 30-bus task
+```
+
+The script `module load`s anaconda, activates the `gnn` env, and checks for `Datasets/{30,118}Bus_outages/` before launching — if a dataset is missing it prints the regeneration command and exits cleanly. If a checkpoint already exists at `Results/<run_name>/` the task no-ops, so you can safely resubmit after failures without overwriting work.
+
+> Same pattern works for the 5 baselines — copy the `.slurm` file and swap the `python train.py` line to use `--gnn_type {GCN|GraphConv|...} --train_loss mse`.
 
 Keep datasets in the same location: `Datasets/{30,118}Bus_outages/` (regenerate with the dataset-generation command above if missing).
 
@@ -131,9 +162,11 @@ gnn/
 train.py            # main training script — single model, any loss
 evaluate.py         # checkpoint evaluation on held-out test set
 dataset_generation/ # synthetic PF dataset generator (pandapower + NR)
-run_training_14_57.sh     # batch run: 5 baselines × 14, 57-bus
-run_training_14_57_pi.sh  # batch run: MPN+mixed × 14, 57-bus
-environment.yml     # conda env spec
+run_training_14_57.sh       # batch run: 5 baselines × 14, 57-bus (local)
+run_training_14_57_pi.sh    # batch run: MPN+mixed × 14, 57-bus (local)
+run_training_30_118_pi.sh   # batch run: MPN+mixed × 30, 118-bus (local)
+slurm_pignn_30_118.slurm    # Adroit HPC job-array version of the 30/118-bus run
+environment.yml             # conda env spec
 ```
 
 ## Physics-informed model — design notes
