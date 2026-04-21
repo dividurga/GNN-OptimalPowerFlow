@@ -38,10 +38,6 @@ htmlcov/
 *.temp
 logs/
 
-# Large/generated project data
-Datasets/
-Results/
-Report/
 
 # Trained model artifacts
 *.pt

@@ -1,0 +1,44 @@
+{
+  "bus": 30,
+  "gnn_type": "ChebConv",
+  "dataset_dir": "Datasets/30Bus_outages",
+  "train_files": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+  ],
+  "val_files": [
+    17,
+    18
+  ],
+  "test_files": [
+    19,
+    20
+  ],
+  "epochs": 500,
+  "patience": 40,
+  "batch_size": 16,
+  "lr": 5e-05,
+  "weight_decay": 1e-06,
+  "feat_size1": 12,
+  "feat_size2": 12,
+  "hidden_size": 128,
+  "dropout": 0.0,
+  "no_batch_norm": false,
+  "output_dir": "Results/30Bus_ChebConv_outages_lessepoch",
+  "best_epoch": 347,
+  "best_val_loss": 0.00025935061566715695
+}

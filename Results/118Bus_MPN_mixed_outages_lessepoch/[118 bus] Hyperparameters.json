@@ -1,0 +1,51 @@
+{
+  "bus": 118,
+  "gnn_type": "MPN",
+  "train_loss": "mixed",
+  "mixed_alpha": 0.9,
+  "physics_scale": 0.02,
+  "mpn_hidden": 129,
+  "mpn_layers": 4,
+  "mpn_K": 3,
+  "dataset_dir": "Datasets/118Bus_outages",
+  "train_files": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+  ],
+  "val_files": [
+    17,
+    18
+  ],
+  "test_files": [
+    19,
+    20
+  ],
+  "epochs": 500,
+  "patience": 40,
+  "batch_size": 16,
+  "lr": 5e-05,
+  "weight_decay": 1e-06,
+  "feat_size1": 12,
+  "feat_size2": 12,
+  "hidden_size": 128,
+  "dropout": 0.0,
+  "no_batch_norm": false,
+  "output_dir": "Results/118Bus_MPN_mixed_outages_lessepoch",
+  "device": "cuda",
+  "best_epoch": 498,
+  "best_val_loss": 5.353452366998116e-05
+}
