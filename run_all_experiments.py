@@ -84,33 +84,29 @@ def make_test_loader(test_dir, test_files, n_bus, branch_info, stats, batch_size
     Load a test dataset and normalise with TRAINING stats — not re-fit from the
     test set itself. This is critical for OOD evaluation to be meaningful.
 
-    Data objects also carry a `physics_edge_index` / `physics_edge_attr` subset
-    (lines + nominal-tap transformers). Evaluation itself doesn't consume them,
-    but keeping the Data schema identical across train / eval avoids surprises.
+    `branch_info` comes from `get_branch_info(n_bus)` — 6-tuple
+    `(from_buses, to_buses, edge_y_fwd, edge_y_rev, n_lines, sn_mva)`.
+    Each Data object's `edge_attr` carries the 4-column admittance
+    representation consumed by the physics loss.
     """
-    from_buses, to_buses, branch_rx, n_lines, _, is_phys = branch_info
+    from_buses, to_buses, edge_y_fwd, edge_y_rev, n_lines, _ = branch_info
     x_mean, x_std = stats['x_mean'], stats['x_std']
     y_mean, y_std = stats['y_mean'], stats['y_std']
     edge_mean, edge_std = stats['edge_mean'], stats['edge_std']
 
     raw, ls = load_excel_datasets(test_dir, test_files)
-    x, y, edge_indices, edge_attrs, phys_edge_indices, phys_edge_attrs = make_dataset(
-        raw, n_bus, ls, from_buses, to_buses, branch_rx, n_lines, is_phys
+    x, y, edge_indices, edge_attrs = make_dataset(
+        raw, n_bus, ls, from_buses, to_buses, edge_y_fwd, edge_y_rev, n_lines
     )
 
     x_norm = (x - x_mean) / x_std
     x_norm[:, :, 4:] = x[:, :, 4:]   # restore bus-type flags (categorical, not normalised)
     y_norm = (y - y_mean) / y_std
-    edge_attrs      = [(ea - edge_mean) / edge_std for ea in edge_attrs]
-    phys_edge_attrs = [(ea - edge_mean) / edge_std for ea in phys_edge_attrs]
+    edge_attrs = [(ea - edge_mean) / edge_std for ea in edge_attrs]
 
     data_list = [
-        Data(x=xi, y=yi, edge_index=ei, edge_attr=ea,
-             physics_edge_index=pei, physics_edge_attr=pea)
-        for xi, yi, ei, ea, pei, pea in zip(
-            x_norm, y_norm, edge_indices, edge_attrs,
-            phys_edge_indices, phys_edge_attrs,
-        )
+        Data(x=xi, y=yi, edge_index=ei, edge_attr=ea)
+        for xi, yi, ei, ea in zip(x_norm, y_norm, edge_indices, edge_attrs)
     ]
     return DataLoader(data_list, batch_size=batch_size, shuffle=False)
 
@@ -121,7 +117,7 @@ def build_model(gnn_type, n_bus, device):
     """Construct model; moves GATConv to CPU on MPS (known instability)."""
     if gnn_type == 'MPN':
         model = MPN(
-            n_bus=n_bus, nfeature_dim=7, efeature_dim=2,
+            n_bus=n_bus, nfeature_dim=7, efeature_dim=4,
             hidden_dim=129, n_gnn_layers=4, K=3, dropout_rate=0.0,
         )
     else:
@@ -188,6 +184,7 @@ def train_model(gnn_type, n_bus, dataset_dir, output_dir,
             edge_mean=stats['edge_mean'], edge_std=stats['edge_std'],
             sn_mva=stats['sn_mva'],
             load_bus_mask=stats['load_bus_mask'],
+            bus_shunt_pu=stats['bus_shunt_pu'],
             alpha=0.9, physics_scale=0.02,
         ).to(mdev)
 
@@ -207,13 +204,10 @@ def train_model(gnn_type, n_bus, dataset_dir, output_dir,
             optimizer.zero_grad()
             y_pred = model(batch)
             if loss_fn is not None:
-                # Physics loss consumes the pre-filtered edge subset (lines +
-                # nominal-tap transformers only) so its π-line / tap=1
-                # assumptions are exact; GNN still sees the full graph via
-                # batch.edge_index / batch.edge_attr.
+                # Physics loss consumes the full graph now — edge_attr carries
+                # the admittance-matrix entries that are exact for any branch.
                 loss = loss_fn(y_pred, batch.y.view(batch.num_graphs, -1),
-                               batch.x,
-                               batch.physics_edge_index, batch.physics_edge_attr)
+                               batch.x, batch.edge_index, batch.edge_attr)
             else:
                 loss = denorm_mse(y_pred, batch.y, y_mean, y_std, batch.num_graphs)
             loss.backward()

@@ -44,23 +44,18 @@ def denorm_mse(y_pred, y_true, y_mean, y_std, batch_size):
 def compute_train_loss(loss_type, loss_fn, y_pred, batch, y_mean, y_std):
     """Compute the configured training loss; y_pred shape [batch, n_bus*2].
 
-    The physics / mixed losses consume the pre-filtered physics-edge subset
-    (`physics_edge_index` / `physics_edge_attr` — lines + nominal-tap
-    transformers only). Off-tap transformer edges are still seen by the GNN
-    via the full `edge_index` / `edge_attr`, but are excluded from the
-    PowerImbalance computation because its π-line + tap=1 formulation is
-    inexact on them. The loss code itself is unchanged — edge selection
-    happens at the call site.
+    The physics / mixed losses now consume the full graph — `batch.edge_attr`
+    carries MATPOWER admittance-matrix entries (G_self, B_self, G_mutual,
+    B_mutual) that are exact for every branch type (lines, off-tap
+    transformers, phase shifters), so no edge subsetting is needed.
     """
     if loss_type == 'mse':
         return denorm_mse(y_pred, batch.y, y_mean, y_std, batch.num_graphs)
-    phys_ei = getattr(batch, 'physics_edge_index', batch.edge_index)
-    phys_ea = getattr(batch, 'physics_edge_attr',  batch.edge_attr)
     if loss_type == 'physics':
-        return loss_fn(y_pred, batch.x, phys_ei, phys_ea)
+        return loss_fn(y_pred, batch.x, batch.edge_index, batch.edge_attr)
     if loss_type == 'mixed':
         y_true = batch.y.view(batch.num_graphs, -1)
-        return loss_fn(y_pred, y_true, batch.x, phys_ei, phys_ea)
+        return loss_fn(y_pred, y_true, batch.x, batch.edge_index, batch.edge_attr)
     raise ValueError(f"unknown loss_type: {loss_type}")
 
 
@@ -192,7 +187,7 @@ def main():
         model = MPN(
             n_bus        = args.bus,
             nfeature_dim = 7,
-            efeature_dim = 2,
+            efeature_dim = 4,
             hidden_dim   = args.mpn_hidden,
             n_gnn_layers = args.mpn_layers,
             K            = args.mpn_K,
@@ -223,6 +218,7 @@ def main():
             edge_mean=stats['edge_mean'], edge_std=stats['edge_std'],
             sn_mva=stats['sn_mva'],
             load_bus_mask=stats['load_bus_mask'],
+            bus_shunt_pu=stats['bus_shunt_pu'],
         ).to(device)
     elif args.train_loss == 'mixed':
         loss_fn = MixedMSEPowerImbalance(
@@ -231,6 +227,7 @@ def main():
             edge_mean=stats['edge_mean'], edge_std=stats['edge_std'],
             sn_mva=stats['sn_mva'],
             load_bus_mask=stats['load_bus_mask'],
+            bus_shunt_pu=stats['bus_shunt_pu'],
             alpha=args.mixed_alpha,
             physics_scale=args.physics_scale,
         ).to(device)

@@ -44,7 +44,7 @@ class MPN(nn.Module):
         self,
         n_bus: int,
         nfeature_dim: int = 7,
-        efeature_dim: int = 2,
+        efeature_dim: int = 4,
         hidden_dim: int = 129,
         n_gnn_layers: int = 4,
         K: int = 3,
