@@ -39,10 +39,10 @@ htmlcov/
 logs/
 
 
-# Trained model artifacts
-*.pt
-*.pth
-*.ckpt
+# Trained model weights are tracked intentionally
+# *.pt
+# *.pth
+# *.ckpt
 
 # Notebook runtime outputs
 jupyter notebook/.ipynb_checkpoints/
