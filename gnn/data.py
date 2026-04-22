@@ -28,6 +28,15 @@ def get_branch_info(n_bus: int):
     pp.runpp(net); ppc branch ordering is: first `n_lines` rows are lines
     (matching net.line index), remaining rows are transformers.
 
+    Also returns a boolean `is_phys` flag per branch: True iff the branch's
+    off-nominal tap ratio is 1.0 (or 0.0, which MATPOWER treats as 1.0). The
+    physics loss's π-line equations are exact only for these edges; off-tap
+    transformers (tap ≠ 1) are **excluded from the physics loss** at the call
+    site, while still participating in the GNN's message passing via the full
+    edge_index / edge_attr. This criterion is universal: any pandapower /
+    MATPOWER-style network provides the tap column, so no code inside the
+    physics loss needs to change for new datasets.
+
     Returns:
         from_buses : list[int], length n_branches
         to_buses   : list[int], length n_branches
@@ -35,6 +44,7 @@ def get_branch_info(n_bus: int):
         n_lines    : int       — first n_lines entries are lines (outage-able);
                                   the rest are transformers (always in service)
         sn_mva     : float     — base MVA
+        is_phys    : np.ndarray, shape [n_branches], bool
     """
     net = NETWORK_MAP[n_bus]()
     pp.runpp(net)
@@ -44,7 +54,9 @@ def get_branch_info(n_bus: int):
     to_buses   = branch[:, 1].real.astype(int).tolist()
     rx = np.stack([branch[:, 2].real.astype(np.float32),
                    branch[:, 3].real.astype(np.float32)], axis=1)
-    return from_buses, to_buses, rx, n_lines, float(net.sn_mva)
+    tap = branch[:, 8].real.astype(np.float32)
+    is_phys = (tap == 0.0) | (np.abs(tap - 1.0) < 1e-6)
+    return from_buses, to_buses, rx, n_lines, float(net.sn_mva), is_phys
 
 
 def get_load_bus_mask(n_bus: int) -> torch.Tensor:
@@ -99,34 +111,67 @@ def make_dataset(
     to_buses: list[int],
     branch_rx: np.ndarray,
     n_lines: int,
+    is_phys: np.ndarray | None = None,
 ):
     """
     Convert raw flat dataset rows into (x, y) tensors, per-sample edge indices,
-    and per-sample edge attributes.
+    edge attributes, and a pre-filtered physics-edge subset.
 
     `from_buses`/`to_buses`/`branch_rx` cover ALL branches (lines + transformers);
     the first `n_lines` entries are lines (subject to outage filtering via
     `line_status`), the rest are transformers (always in service).
 
+    `is_phys` (per-branch bool, length = n_branches) selects the edges that
+    should participate in the physics loss (true lines + nominal-tap
+    transformers). If omitted, every branch is treated as physics-valid.
+
     x shape: [n_samples, n_bus, 7]  — P, Q, V, δ, is_pv, is_pq, is_slack
     y shape: [n_samples, n_bus, 2]  — V, δ  (Newton-Raphson ground truth)
-    edge_indices: list of [2, 2*n_active] tensors, one per sample.
-    edge_attrs:   list of [2*n_active, 2] tensors, mirrored to match edge_index.
+    edge_indices:     list of [2, 2*n_active]        — full bidirectional graph
+    edge_attrs:       list of [2*n_active, 2]        — mirrored R, X
+    phys_edge_indices: list of [2, 2*n_phys_active]  — subset for physics loss
+    phys_edge_attrs:   list of [2*n_phys_active, 2]  — mirrored R, X (physics subset)
     """
-    x_raw, y_raw, edge_indices, edge_attrs = [], [], [], []
+    x_raw, y_raw = [], []
+    edge_indices, edge_attrs = [], []
+    phys_edge_indices, phys_edge_attrs = [], []
+
+    if is_phys is None:
+        is_phys = np.ones(len(from_buses), dtype=bool)
 
     trafo_from = from_buses[n_lines:]
     trafo_to   = to_buses[n_lines:]
     trafo_rx   = branch_rx[n_lines:]
+    trafo_phys = is_phys[n_lines:]
     line_from  = from_buses[:n_lines]
     line_to    = to_buses[:n_lines]
     line_rx    = branch_rx[:n_lines]
+    line_phys  = is_phys[:n_lines]
 
-    base_fb = line_from + trafo_from
-    base_tb = line_to   + trafo_to
-    base_ei = torch.tensor([base_fb + base_tb, base_tb + base_fb], dtype=torch.long)
-    base_rx = np.concatenate([line_rx, trafo_rx], axis=0)
-    base_ea = torch.tensor(np.concatenate([base_rx, base_rx], axis=0), dtype=torch.float)
+    def _build_sample_edges(active_line_mask: np.ndarray):
+        """Return (ei, ea, phys_ei, phys_ea) for one sample."""
+        act_line_from = [line_from[j] for j, a in enumerate(active_line_mask) if a]
+        act_line_to   = [line_to[j]   for j, a in enumerate(active_line_mask) if a]
+        act_line_rx   = line_rx[active_line_mask]
+        act_line_phys = line_phys[active_line_mask]
+
+        all_from = act_line_from + trafo_from
+        all_to   = act_line_to   + trafo_to
+        all_rx   = np.concatenate([act_line_rx, trafo_rx], axis=0)
+        all_phys = np.concatenate([act_line_phys, trafo_phys], axis=0)
+
+        ei = torch.tensor([all_from + all_to, all_to + all_from], dtype=torch.long)
+        ea = torch.tensor(np.concatenate([all_rx, all_rx], axis=0), dtype=torch.float)
+
+        phys_mask = np.concatenate([all_phys, all_phys], axis=0)
+        phys_mask_t = torch.tensor(phys_mask, dtype=torch.bool)
+        phys_ei = ei[:, phys_mask_t]
+        phys_ea = ea[phys_mask_t]
+        return ei, ea, phys_ei, phys_ea
+
+    base_ei, base_ea, base_phys_ei, base_phys_ea = _build_sample_edges(
+        np.ones(n_lines, dtype=bool)
+    )
 
     for i in range(len(dataset)):
         x_sample, y_sample = [], []
@@ -151,23 +196,20 @@ def make_dataset(
 
         if line_status is not None:
             active = line_status[i].astype(bool)
-            fb = [line_from[j] for j, a in enumerate(active) if a] + trafo_from
-            tb = [line_to[j]   for j, a in enumerate(active) if a] + trafo_to
-            ei = torch.tensor([fb + tb, tb + fb], dtype=torch.long)
-            rx_active = np.concatenate([line_rx[active], trafo_rx], axis=0)
-            ea = torch.tensor(np.concatenate([rx_active, rx_active], axis=0), dtype=torch.float)
+            ei, ea, phys_ei, phys_ea = _build_sample_edges(active)
         else:
-            ei = base_ei
-            ea = base_ea
+            ei, ea, phys_ei, phys_ea = base_ei, base_ea, base_phys_ei, base_phys_ea
 
         x_raw.append(x_sample)
         y_raw.append(y_sample)
         edge_indices.append(ei)
         edge_attrs.append(ea)
+        phys_edge_indices.append(phys_ei)
+        phys_edge_attrs.append(phys_ea)
 
     x = torch.tensor(x_raw, dtype=torch.float)
     y = torch.tensor(y_raw, dtype=torch.float)
-    return x, y, edge_indices, edge_attrs
+    return x, y, edge_indices, edge_attrs, phys_edge_indices, phys_edge_attrs
 
 
 def normalize_dataset(x: torch.Tensor, y: torch.Tensor):
@@ -196,7 +238,7 @@ def denormalize(tensor: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> 
 
 def build_edge_index(n_bus: int) -> torch.Tensor:
     """Build bidirectional edge index from the base network (lines + transformers, all in service)."""
-    from_buses, to_buses, _, _, _ = get_branch_info(n_bus)
+    from_buses, to_buses, _, _, _, _ = get_branch_info(n_bus)
     return torch.tensor(
         [from_buses + to_buses, to_buses + from_buses], dtype=torch.long
     )
@@ -225,19 +267,24 @@ def build_dataloaders(
         edge_mean, edge_std — edge attribute stats [2] (applied globally)
         sn_mva             — base MVA of the network (for physics loss)
     """
-    from_buses, to_buses, branch_rx, n_lines, sn_mva = get_branch_info(n_bus)
+    from_buses, to_buses, branch_rx, n_lines, sn_mva, is_phys = get_branch_info(n_bus)
 
     raw_train, ls_train = load_excel_datasets(dataset_dir, train_indices)
     raw_val,   ls_val   = load_excel_datasets(dataset_dir, val_indices)
     raw_test,  ls_test  = load_excel_datasets(dataset_dir, test_indices)
 
-    x_train, y_train, ei_train, ea_train = make_dataset(raw_train, n_bus, ls_train, from_buses, to_buses, branch_rx, n_lines)
-    x_val,   y_val,   ei_val,   ea_val   = make_dataset(raw_val,   n_bus, ls_val,   from_buses, to_buses, branch_rx, n_lines)
-    x_test,  y_test,  ei_test,  ea_test  = make_dataset(raw_test,  n_bus, ls_test,  from_buses, to_buses, branch_rx, n_lines)
+    x_train, y_train, ei_train, ea_train, pei_train, pea_train = make_dataset(
+        raw_train, n_bus, ls_train, from_buses, to_buses, branch_rx, n_lines, is_phys)
+    x_val,   y_val,   ei_val,   ea_val,   pei_val,   pea_val   = make_dataset(
+        raw_val,   n_bus, ls_val,   from_buses, to_buses, branch_rx, n_lines, is_phys)
+    x_test,  y_test,  ei_test,  ea_test,  pei_test,  pea_test  = make_dataset(
+        raw_test,  n_bus, ls_test,  from_buses, to_buses, branch_rx, n_lines, is_phys)
 
     x_train, y_train, x_mean, y_mean, x_std, y_std = normalize_dataset(x_train, y_train)
 
-    # Edge attribute stats: computed globally across all training edges
+    # Edge attribute stats: computed globally across all training edges (full graph).
+    # Physics-edge subset uses the same stats so the physics loss can denormalize
+    # using the same mean/std it stores.
     all_train_edges = torch.cat(ea_train, dim=0)
     edge_mean = all_train_edges.mean(0)
     edge_std  = all_train_edges.std(0)
@@ -246,9 +293,12 @@ def build_dataloaders(
     def _normalize_edges(ea_list):
         return [(ea - edge_mean) / edge_std for ea in ea_list]
 
-    ea_train = _normalize_edges(ea_train)
-    ea_val   = _normalize_edges(ea_val)
-    ea_test  = _normalize_edges(ea_test)
+    ea_train  = _normalize_edges(ea_train)
+    ea_val    = _normalize_edges(ea_val)
+    ea_test   = _normalize_edges(ea_test)
+    pea_train = _normalize_edges(pea_train)
+    pea_val   = _normalize_edges(pea_val)
+    pea_test  = _normalize_edges(pea_test)
 
     def _apply_train_stats(x_raw):
         x_norm = (x_raw - x_mean) / x_std
@@ -260,16 +310,17 @@ def build_dataloaders(
     y_val  = (y_val  - y_mean) / y_std
     y_test = (y_test - y_mean) / y_std
 
-    def _to_loader(x, y, edge_indices, edge_attrs, shuffle):
+    def _to_loader(x, y, eis, eas, peis, peas, shuffle):
         data_list = [
-            Data(x=xi, y=yi, edge_index=ei, edge_attr=ea)
-            for xi, yi, ei, ea in zip(x, y, edge_indices, edge_attrs)
+            Data(x=xi, y=yi, edge_index=ei, edge_attr=ea,
+                 physics_edge_index=pei, physics_edge_attr=pea)
+            for xi, yi, ei, ea, pei, pea in zip(x, y, eis, eas, peis, peas)
         ]
         return DataLoader(data_list, batch_size=batch_size, shuffle=shuffle)
 
-    train_loader = _to_loader(x_train, y_train, ei_train, ea_train, shuffle=True)
-    val_loader   = _to_loader(x_val,   y_val,   ei_val,   ea_val,   shuffle=False)
-    test_loader  = _to_loader(x_test,  y_test,  ei_test,  ea_test,  shuffle=False)
+    train_loader = _to_loader(x_train, y_train, ei_train, ea_train, pei_train, pea_train, shuffle=True)
+    val_loader   = _to_loader(x_val,   y_val,   ei_val,   ea_val,   pei_val,   pea_val,   shuffle=False)
+    test_loader  = _to_loader(x_test,  y_test,  ei_test,  ea_test,  pei_test,  pea_test,  shuffle=False)
 
     stats = dict(
         x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std,

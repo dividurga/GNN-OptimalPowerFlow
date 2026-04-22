@@ -42,14 +42,25 @@ def denorm_mse(y_pred, y_true, y_mean, y_std, batch_size):
 
 
 def compute_train_loss(loss_type, loss_fn, y_pred, batch, y_mean, y_std):
-    """Compute the configured training loss; y_pred shape [batch, n_bus*2]."""
+    """Compute the configured training loss; y_pred shape [batch, n_bus*2].
+
+    The physics / mixed losses consume the pre-filtered physics-edge subset
+    (`physics_edge_index` / `physics_edge_attr` — lines + nominal-tap
+    transformers only). Off-tap transformer edges are still seen by the GNN
+    via the full `edge_index` / `edge_attr`, but are excluded from the
+    PowerImbalance computation because its π-line + tap=1 formulation is
+    inexact on them. The loss code itself is unchanged — edge selection
+    happens at the call site.
+    """
     if loss_type == 'mse':
         return denorm_mse(y_pred, batch.y, y_mean, y_std, batch.num_graphs)
+    phys_ei = getattr(batch, 'physics_edge_index', batch.edge_index)
+    phys_ea = getattr(batch, 'physics_edge_attr',  batch.edge_attr)
     if loss_type == 'physics':
-        return loss_fn(y_pred, batch.x, batch.edge_index, batch.edge_attr)
+        return loss_fn(y_pred, batch.x, phys_ei, phys_ea)
     if loss_type == 'mixed':
         y_true = batch.y.view(batch.num_graphs, -1)
-        return loss_fn(y_pred, y_true, batch.x, batch.edge_index, batch.edge_attr)
+        return loss_fn(y_pred, y_true, batch.x, phys_ei, phys_ea)
     raise ValueError(f"unknown loss_type: {loss_type}")
 
 
