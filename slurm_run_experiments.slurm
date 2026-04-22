@@ -47,8 +47,12 @@ mkdir -p logs Results
 # ── Environment ───────────────────────────────────────────────────────────────
 module purge
 module load anaconda3/2024.6 || module load anaconda3 || true
+# Conda's activation script references $PS1 which isn't set in batch shells;
+# the outer `set -u` would then abort. Disable nounset around conda activation.
+set +u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate gnn
+set -u
 
 # ── Bus selection ─────────────────────────────────────────────────────────────
 BUS_LIST=(14 30 57 118)
