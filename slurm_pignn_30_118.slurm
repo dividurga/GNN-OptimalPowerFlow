@@ -39,8 +39,12 @@ module purge
 module load anaconda3/2024.6 || module load anaconda3 || true
 
 # Activate the project's conda env. Change `gnn` if your env name differs.
+# Conda's activation script references $PS1 which isn't set in batch shells;
+# the outer `set -u` would then abort. Disable nounset around conda activation.
+set +u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate gnn
+set -u
 
 # ---- pick bus system from the array index ------------------------------------
 BUS_LIST=(30 118)
